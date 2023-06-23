@@ -245,7 +245,7 @@ class AIApplicationTool(Tool):
 
     def __init__(self, **kwargs):
         if "name" not in kwargs:
-            kwargs["name"] = type(self.app).__name__
+            kwargs["name"] = type(kwargs["app"]).name
         super().__init__(**kwargs)
 
     def run(self, input_text: str) -> str:
