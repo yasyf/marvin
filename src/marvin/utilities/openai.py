@@ -4,6 +4,7 @@ from logging import Logger
 from typing import TYPE_CHECKING, Any, Callable, Union
 
 import openai
+from pydantic import PrivateAttr
 
 import marvin
 import marvin.utilities.llms
@@ -37,7 +38,16 @@ class OpenAIFunction(MarvinBaseModel):
     name: str
     description: str = None
     parameters: dict[str, Any] = {"type": "object", "properties": {}}
-    fn: Callable = None
+    _fn: Callable = PrivateAttr(None)
+
+    @property
+    def fn(self):
+        return self._fn
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if "fn" in kwargs:
+            self._fn = kwargs.pop("fn")
 
     @classmethod
     def from_function(cls, fn: Callable, **kwargs):
@@ -123,11 +133,14 @@ async def call_llm_chat(
         # ----------------------------------
         if fn_call := msg.get("function_call"):
             fn_name = fn_call.get("name")
-            fn_args = json.loads(fn_call.get("arguments", "{}"))
+            fn_args = fn_call.get("arguments", "{}")
             try:
+                # attempt to load the arguments as JSON (they may be malformed)
+                fn_args = json.loads(fn_args)
                 # retrieve the function
-                function = next((f for f in functions if f.name == fn_name), None)
-                if function is None:
+                try:
+                    function = next(f for f in functions if f.name == fn_name)
+                except StopIteration:
                     raise ValueError(f'Function "{fn_call["name"]}" not found.')
 
                 if not isinstance(fn_args, dict):

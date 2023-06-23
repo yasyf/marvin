@@ -49,7 +49,7 @@ class Tool(MarvinBaseModel, LoggerMixin):
             name=self.name,
             description=description,
             parameters=schema,
-            fn=self,
+            fn=self.run,
         )
 
 

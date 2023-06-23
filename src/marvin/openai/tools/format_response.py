@@ -75,5 +75,5 @@ class FormatResponse(Tool):
             name=self.__class__.__name__,
             description=self.description,
             parameters=self.type_schema,
-            fn=self,
+            fn=self.run,
         )

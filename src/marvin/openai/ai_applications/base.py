@@ -7,6 +7,7 @@ from typing import Any, Union
 import uvicorn
 from fastapi import Body, FastAPI
 from jsonpatch import JsonPatch
+from prefect import flow, task
 from pydantic import BaseModel, Field, PrivateAttr, validator
 
 import marvin
@@ -46,7 +47,8 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
     Each time the user runs the application by sending a message, you must take
     the following steps:
     
-    {% if app.ai_state_enabled -%}
+    {% if app.ai_state_enabled -%} 
+    
     - Call the `UpdateAIState` function to update your own state. Use your state
       to track notes, objectives, in-progress work, and to break problems down
       into solvable, possibly dependent parts. You state consists of a few
@@ -57,21 +59,25 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
           or operate the application. These are exclusively related to your role
           as intermediary and you interact with the user and application. Do not
           track application data or state here.
-        - `tasks`: a list of tasks you are working on. Tasks track goals,
-          milestones, in-progress work, and break problems down into all the
-          discrete steps needed to solve them. You should create a new task for
-          any work that will require a function call other than updating state,
-          or will require more than one state update to complete. You do not
-          need to create tasks for simple state updates. Use optional parent
-          tasks to indicate nested relationships; parent tasks are not completed
-          until all their children are complete. Use optional upstream tasks to
-          indicate dependencies; a task can not be completed until its upstream
-          tasks are completed.
+        - `tasks`: a list of tasks you are working on. Tasks form a DAG and
+          track goals, milestones, in-progress work, or break problems down into
+          all the discrete steps needed to solve them. You should create a new
+          task for EITHER any work that will require a function call other than
+          updating state OR will require more than one state update to complete.
+          You should also create a new task for any work or action you expect to
+          take in the future; you can always cancel it if you don't. You do not
+          need to create tasks for simple state updates. Update task states
+          appropriately. 
+            - use `upstream_task_ids` to indicate that a task can not start
+              until the upstream tasks are completed.
+            - use `nest_task_id` to indicate that this task must be completed
+              before the nest task can be completed.
     {%- endif %}
 
     - Call any functions necessary to achieve the application's purpose.
     
-    {% if app.state_enabled -%}
+    {% if app.state_enabled -%} 
+    
     - Call the `UpdateAppState` function to update the application's state. This
       is where you should store any information relevant to the application
       itself.
@@ -84,26 +90,31 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
 
     # Current details
     
-    This is the description of the application:
+    ## Application description
      
     {{ app.description }}
     
-    This is the application's state:
+    ## Application state
      
     {{ app.state.json() }}
     
-    {% if app.ai_state_enabled %}
-    This is your AI state:
+    {% if app.ai_state_enabled -%} 
     
-    {{ app.ai_state.json() }}
-    {% endif %}
-        
-    Today's date is {{ dt() }}
+    ## AI (your) state
+    
+    {{ app.ai_state.json() }} 
+    
+    {%- endif %}
+
+    ## Today's date
+    
+    {{ dt() }}
     
     """))
 
 
 class TaskState(Enum):
+    PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -117,8 +128,8 @@ class Task(BaseModel):
     id: int
     description: str
     upstream_task_ids: list[int] = None
-    parent_task_id: int = None
-    state: TaskState = TaskState.IN_PROGRESS
+    nest_task_id: int = None
+    state: TaskState = TaskState.PENDING
 
 
 class AIState(BaseModel):
@@ -131,6 +142,7 @@ class FreeformState(BaseModel):
 
 
 class AIApplication(MarvinBaseModel, LoggerMixin):
+    name: str = None
     description: str
     state: BaseModel = Field(default_factory=FreeformState)
     ai_state: AIState = Field(default_factory=AIState)
@@ -140,12 +152,23 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
     state_enabled: bool = True
     ai_state_enabled: bool = True
 
+    @validator("name", always=True)
+    def validate_name(cls, v):
+        if v is None:
+            v = cls.__name__
+        return v
+
     @validator("tools", pre=True)
     def validate_tools(cls, v):
         v = [t.as_tool() if isinstance(t, AIApplication) else t for t in v]
         return v
 
     async def run(self, input_text: str = None):
+        # every invocation of the application is represented as a flow
+        run_flow = flow(name=self.name)(self._run)
+        return await run_flow(input_text=input_text)
+
+    async def _run(self, input_text: str = None):
         # put a placeholder for the system message
         messages = [None]
 
@@ -174,7 +197,9 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
                 role="system", content=AI_APP_SYSTEM_MESSAGE.render(app=self)
             )
 
-            response = await call_llm_chat(
+            # every call to the LLM is represented as a task
+            call_llm_task = task()(call_llm_chat)
+            response = await call_llm_task(
                 messages=messages,
                 functions=[t.as_openai_function() for t in tools],
                 function_call="auto" if i < max_iterations else "none",
@@ -211,8 +236,8 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
         server = uvicorn.Server(config=config)
         await server.serve()
 
-    def as_tool(self, name: str = None) -> Tool:
-        return AIApplicationTool(app=self, name=name)
+    def as_tool(self) -> Tool:
+        return AIApplicationTool(app=self)
 
 
 class AIApplicationTool(Tool):
