@@ -3,18 +3,21 @@ import inspect
 import math
 from enum import Enum
 from typing import Any, Union
+from uuid import UUID
 
+import prefect
+import prefect.states
 import uvicorn
 from fastapi import Body, FastAPI
 from jsonpatch import JsonPatch
-from prefect import flow, task
 from pydantic import BaseModel, Field, PrivateAttr, validator
 
 import marvin
 from marvin.bot.history import History, InMemoryHistory
 from marvin.models.threads import BaseMessage, Message
 from marvin.openai import Tool
-from marvin.utilities.openai import call_llm_chat
+from marvin.utilities import prefect_utils
+from marvin.utilities.openai import OpenAIFunction, call_llm_chat
 from marvin.utilities.strings import jinja_env
 from marvin.utilities.types import LoggerMixin, MarvinBaseModel
 
@@ -47,8 +50,6 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
     Each time the user runs the application by sending a message, you must take
     the following steps:
     
-    {% if app.ai_state_enabled -%} 
-    
     - Call the `UpdateAIState` function to update your own state. Use your state
       to track notes, objectives, in-progress work, and to break problems down
       into solvable, possibly dependent parts. You state consists of a few
@@ -72,16 +73,12 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
               until the upstream tasks are completed.
             - use `nest_task_id` to indicate that this task must be completed
               before the nest task can be completed.
-    {%- endif %}
 
     - Call any functions necessary to achieve the application's purpose.
-    
-    {% if app.state_enabled -%} 
     
     - Call the `UpdateAppState` function to update the application's state. This
       is where you should store any information relevant to the application
       itself.
-    {%- endif %}
 
     You can call these functions at any time, in any order, as necessary.
     Finally, respond to the user with an informative message. Remember that the
@@ -96,16 +93,20 @@ AI_APP_SYSTEM_MESSAGE = jinja_env.from_string(inspect.cleandoc("""
     
     ## Application state
      
-    {{ app.state.json() }}
+    {{ app.state.state.json() }}
     
-    {% if app.ai_state_enabled -%} 
+    with schema
+    
+    {{app.state.state.schema()}}
     
     ## AI (your) state
     
     {{ app.ai_state.json() }} 
     
-    {%- endif %}
-
+    with schema
+    
+    {{app.ai_state.schema()}}
+    
     ## Today's date
     
     {{ dt() }}
@@ -118,7 +119,6 @@ class TaskState(Enum):
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
-    SKIPPED = "SKIPPED"
 
 
 class Task(BaseModel):
@@ -126,10 +126,12 @@ class Task(BaseModel):
         validate_assignment = True
 
     id: int
-    description: str
+    name: str
+    description: str = None
     upstream_task_ids: list[int] = None
     nest_task_id: int = None
     state: TaskState = TaskState.PENDING
+    prefect_flow_run_id: UUID = None
 
 
 class AIState(BaseModel):
@@ -141,21 +143,41 @@ class FreeformState(BaseModel):
     state: dict[str, Any] = {}
 
 
+class AppState(BaseModel):
+    state: BaseModel = Field(default_factory=FreeformState)
+    prefect_flow_run_id: UUID = None
+
+
 class AIApplication(MarvinBaseModel, LoggerMixin):
     name: str = None
     description: str
-    state: BaseModel = Field(default_factory=FreeformState)
+    state: AppState = Field(default_factory=AppState)
     ai_state: AIState = Field(default_factory=AIState)
     tools: list[Tool] = []
     history: History = Field(default_factory=InMemoryHistory)
 
-    state_enabled: bool = True
-    ai_state_enabled: bool = True
-
-    @validator("name", always=True)
+    @validator("name", pre=True, always=True)
     def validate_name(cls, v):
         if v is None:
             v = cls.__name__
+        return v
+
+    @validator("state", pre=True, always=True)
+    def validate_state(cls, v):
+        # users will often pass dicts or initial state objects, but we need
+        # to embed them in an `AppState` object
+        if v is None:
+            v = AppState()
+        elif not isinstance(v, AppState):
+            try:
+                type(v)()
+            except Exception:
+                raise ValueError(
+                    "The provided state object can not be initialized with no data, so"
+                    " it can not be cleared. Please provide a state object that can be"
+                    " cleared."
+                )
+            v = AppState(state=v)
         return v
 
     @validator("tools", pre=True)
@@ -163,10 +185,29 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
         v = [t.as_tool() if isinstance(t, AIApplication) else t for t in v]
         return v
 
+    async def clear_state(self):
+        if self.state.prefect_flow_run_id:
+            async with prefect.get_client() as client:
+                client.set_flow_run_state(
+                    flow_run_id=self.state.prefect_flow_run_id,
+                    state=prefect.states.Completed(),
+                )
+            self.state.prefect_flow_run_id = None
+
+        cleared_state = type(self.state.state)()
+        self.state = AppState(state=cleared_state)
+        self.ai_state = AIState()
+
     async def run(self, input_text: str = None):
-        # every invocation of the application is represented as a flow
-        run_flow = flow(name=self.name)(self._run)
-        return await run_flow(input_text=input_text)
+        # if we don't have a flow run id for this invocation, create one
+        if not self.state.prefect_flow_run_id:
+            flow_run = await prefect_utils.create_flow_run(
+                flow_name=self.name,
+                state=prefect.states.Pending(),
+            )
+            self.state.prefect_flow_run_id = flow_run.id
+
+        return await self._run(input_text=input_text)
 
     async def _run(self, input_text: str = None):
         # put a placeholder for the system message
@@ -182,11 +223,10 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
             messages.append(input_message)
 
         # set up tools
-        tools = self.tools.copy()
-        if self.state_enabled:
-            tools.append(UpdateAppState(app=self))
-        if self.ai_state_enabled:
-            tools.append(UpdateAIState(app=self))
+        tools = [
+            TaskTool(app=self, tool=t)
+            for t in [*self.tools, UpdateAppState(app=self), UpdateAIState(app=self)]
+        ]
 
         i = 1
         max_iterations = marvin.settings.llm_max_function_iterations or math.inf
@@ -198,11 +238,32 @@ class AIApplication(MarvinBaseModel, LoggerMixin):
             )
 
             # every call to the LLM is represented as a task
-            call_llm_task = task()(call_llm_chat)
-            response = await call_llm_task(
-                messages=messages,
-                functions=[t.as_openai_function() for t in tools],
-                function_call="auto" if i < max_iterations else "none",
+            call_llm_task = call_llm_chat
+
+            task_run = await prefect_utils.create_task_run(
+                flow_run_id=self.state.prefect_flow_run_id,
+                task_name="call_llm",
+                state=prefect.states.Running(),
+                task_inputs=dict(
+                    messages=messages, functions=[t.as_openai_function() for t in tools]
+                ),
+            )
+
+            try:
+                response = await call_llm_task(
+                    messages=messages,
+                    functions=[t.as_openai_function() for t in tools],
+                    function_call="auto" if i < max_iterations else "none",
+                )
+            except Exception as exc:
+                await prefect_utils.set_task_run_state(
+                    task_run_id=task_run.id,
+                    state=prefect.states.Failed(message=str(exc)),
+                )
+                raise exc
+            await prefect_utils.set_task_run_state(
+                task_run_id=task_run.id,
+                state=prefect.states.Completed(data=response),
             )
 
             # if the result was a function call, then run the LLM again with the
@@ -270,8 +331,7 @@ class UpdateAppState(Tool):
     _app: "AIApplication" = PrivateAttr()
     description = """
         Update the application state by providing a list of JSON patch
-        documents. The state must always comply with this JSON schema: {{
-        TOOL._app.state.schema() }}
+        documents. It will be validated against the app state JSON schema.
         """
 
     def __init__(self, app: AIApplication, **kwargs):
@@ -292,17 +352,116 @@ class UpdateAIState(Tool):
 
     _app: "AIApplication" = PrivateAttr()
     description = """
-        Update the AI state by providing a list of JSON patch
-        documents. The state must always comply with this JSON schema: {{
-        TOOL._app.ai_state.schema() }}
+        Update the AI state by providing a list of JSON patch documents. It will
+        be validated against the AI state JSON schema. Never update a task's
+        Prefect flow id.
         """
 
     def __init__(self, app: AIApplication, **kwargs):
         self._app = app
         super().__init__(**kwargs)
 
-    def run(self, patches: list[JSONPatchModel]):
+    async def run(self, patches: list[JSONPatchModel]):
         patch = JsonPatch(patches)
         updated_state = patch.apply(self._app.ai_state.dict())
-        self._app.ai_state = type(self._app.ai_state)(**updated_state)
+
+        old_state = self._app.ai_state
+        new_state = AIState(**updated_state)
+
+        # update the state of any existing tasks
+        for new_task in new_state.tasks:
+            old_task = next((t for t in old_state.tasks if t.id == new_task.id), None)
+
+            # the new task was just created
+            if old_task is None:
+                flow_run = await prefect_utils.create_flow_run(
+                    flow_name=f"{new_task.name}",
+                    flow_run_name=f"AI plan {new_task.id}",
+                    state=prefect.states.Pending(),
+                    parent_flow_run_id=self._app.state.prefect_flow_run_id,
+                )
+                new_task.prefect_flow_run_id = flow_run.id
+
+            # the task has a state update
+            elif new_task.state != old_task.state:
+                if new_task.state == TaskState.COMPLETED:
+                    prefect_state = prefect.states.Completed()
+                elif new_task.state == TaskState.FAILED:
+                    prefect_state = prefect.states.Failed()
+                elif new_task.state == TaskState.IN_PROGRESS:
+                    prefect_state = prefect.states.Running()
+                elif new_task.state == TaskState.PENDING:
+                    prefect_state = prefect.states.Pending()
+
+                await prefect_utils.set_flow_run_state(
+                    flow_run_id=new_task.prefect_flow_run_id,
+                    state=prefect_state,
+                )
+
+        # the task was deleted
+        for old_task in old_state.tasks:
+            new_task = next((t for t in new_state.tasks if t.id == old_task.id), None)
+            if new_task is None and old_task.state not in (
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+            ):
+                await prefect_utils.set_flow_run_state(
+                    flow_run_id=new_task.prefect_flow_run_id,
+                    state=prefect.states.Cancelled(),
+                )
+
+        self._app.ai_state = new_state
         return f"AI state updated successfully! (payload was {patches})"
+
+
+class TaskTool(Tool):
+    """
+    This tool creates Prefect tasks from any wrapped function call and
+    correlates them to an application's task list
+    """
+
+    tool: Tool
+    _app: "AIApplication" = PrivateAttr()
+
+    def __init__(self, app: AIApplication, **kwargs):
+        self._app = app
+        super().__init__(**kwargs)
+
+    def as_openai_function(self) -> OpenAIFunction:
+        fn_def = self.tool.as_openai_function()
+        fn_def.description += (
+            "\n\nIf this function call relates to any of your AI state tasks, provide"
+            " the task_id_ for tracking purposes."
+        )
+        fn_def._fn = self.run
+        fn_def.parameters["properties"]["task_id_"] = {"type": "integer"}
+
+        return fn_def
+
+    async def run(self, task_id_: int = None, **kwargs):
+        app_task = next((t for t in self._app.ai_state.tasks if t.id == task_id_), None)
+
+        if app_task is None:
+            prefect_flow_run_id = self._app.state.prefect_flow_run_id
+        else:
+            prefect_flow_run_id = app_task.prefect_flow_run_id
+
+        task_run = await prefect_utils.create_task_run(
+            flow_run_id=prefect_flow_run_id,
+            task_name=self.tool.name,
+            task_inputs=kwargs,
+            state=prefect.states.Running(),
+        )
+        try:
+            result = self.tool.run(**kwargs)
+            if inspect.iscoroutine(result):
+                result = await result
+        except Exception as exc:
+            await prefect_utils.set_task_run_state(
+                task_run_id=task_run.id, state=prefect.states.Failed(message=str(exc))
+            )
+            raise exc
+        await prefect_utils.set_task_run_state(
+            task_run_id=task_run.id, state=prefect.states.Completed(data=result)
+        )
+        return result
