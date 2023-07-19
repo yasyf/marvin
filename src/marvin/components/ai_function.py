@@ -1,26 +1,21 @@
-import asyncio
 import functools
 import inspect
 import re
-from typing import Callable, TypeVar
+from typing import Callable, ParamSpec, TypeVar
 
 from pydantic import BaseModel
 
-from marvin.engine.executors import OpenAIFunctionsExecutor
+from marvin.engine.executors import OpenAIExecutor
 from marvin.prompts import library as prompt_library
 from marvin.tools.format_response import FormatResponse
 from marvin.utilities.async_utils import run_sync
 from marvin.utilities.types import safe_issubclass
 
 T = TypeVar("T")
-A = TypeVar("A")
+P = ParamSpec("P")
 
 prompts = [
     prompt_library.System(content="""
-        {% if instructions %}
-        {{ instructions }}
-        
-        {% endif %}
         Your job is to generate likely outputs for a Python function with the
         following signature and docstring:
     
@@ -67,90 +62,29 @@ prompts = [
 
 class AIFunction:
     def __init__(
-        self,
-        *,
-        fn: Callable = None,
-        name: str = None,
-        description: str = None,
-        instructions: str = None,
+        self, *, fn: Callable = None, name: str = None, description: str = None
     ):
-        self._fn = fn
+        if fn is None:
+            fn = self.run
+        self.fn = fn
+
         self.name = name or fn.__name__
         self.description = description or fn.__doc__
-        self.instructions = instructions
         self.__signature__ = inspect.signature(fn)
 
         super().__init__()
-
-    @property
-    def fn(self):
-        """
-        Return's the `run` method if no function was provided, otherwise returns
-        the function provided at initialization.
-        """
-        if self._fn is None:
-            return self.run
-        else:
-            return self._fn
-
-    def is_async(self):
-        """
-        Returns whether self.fn is an async function.
-
-        This is used to determine whether to invoke the AI function on call, or
-        return an awaitable.
-        """
-        return inspect.iscoroutinefunction(self.fn)
 
     def __repr__(self):
         return f"<AIFunction {self.name}>"
 
     def __call__(self, *args, **kwargs):
         output = self._call(*args, **kwargs)
-        if not self.is_async():
+
+        # if the provided fn is not async, run it immediately
+        if not inspect.iscoroutinefunction(self.fn):
             output = run_sync(output)
 
         return output
-
-    def map(self, *map_args: list, **map_kwargs: list):
-        """
-        Map the AI function over a sequence of arguments. Runs concurrently.
-
-        Arguments should be provided as if calling the function normally, but
-        each argument must be a list. The function is called once for each item
-        in the list, and the results are returned in a list.
-
-        For example, fn.map([1, 2]) is equivalent to [fn(1), fn(2)].
-
-        fn.map([1, 2], x=['a', 'b']) is equivalent to [fn(1, x='a'), fn(2,
-        x='b')].
-        """
-
-        coros = []
-
-        i = 0
-        while True:
-            call_args = []
-            call_kwargs = {}
-            try:
-                for arg in map_args:
-                    call_args.append(arg[i])
-                for k, v in map_kwargs.items():
-                    call_kwargs[k] = v[i]
-            except IndexError:
-                break
-            call_coro = self._call(*call_args, **call_kwargs)
-            coros.append(call_coro)
-            i += 1
-
-        # gather returns a future, but run_sync requires a coroutine
-        async def gather_coros():
-            return await asyncio.gather(*coros)
-
-        result = gather_coros()
-        if not self.is_async():
-            result = run_sync(result)
-        return result
 
     async def _call(self, *args, **kwargs):
         # Get function signature
@@ -173,7 +107,7 @@ class AIFunction:
         bound_args = sig.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
-        executor = OpenAIFunctionsExecutor(
+        executor = OpenAIExecutor(
             functions=[FormatResponse(type_=return_annotation).as_openai_function()],
             function_call={"name": "FormatResponse"},
             max_iterations=1,
@@ -188,7 +122,6 @@ class AIFunction:
                 ),
                 basemodel_response=safe_issubclass(return_annotation, BaseModel),
                 input_binds=bound_args.arguments,
-                instructions=self.instructions,
             ),
         )
 
@@ -200,15 +133,12 @@ class AIFunction:
         raise NotImplementedError()
 
 
-def ai_fn(fn: Callable[[A], T] = None, instructions: str = None) -> Callable[[A], T]:
+def ai_fn(fn: Callable[P, T] = None) -> Callable[P, T]:
     """Decorator that transforms a Python function with a signature and docstring
     into a prompt for an AI to predict the function's output.
 
     Args:
         fn: The function to decorate - this function does not need source code
-
-    Keyword Args:
-        instructions: Added context for the AI to help it predict the function's output.
 
     Example:
         Returns a word that rhymes with the input word.
@@ -222,5 +152,5 @@ def ai_fn(fn: Callable[[A], T] = None, instructions: str = None) -> Callable[[A]
     """
     # this allows the decorator to be used with or without calling it
     if fn is None:
-        return functools.partial(ai_fn, instructions=instructions)  # , **kwargs)
-    return AIFunction(fn=fn, instructions=instructions)
+        return functools.partial(ai_fn)  # , **kwargs)
+    return AIFunction(fn=fn)
